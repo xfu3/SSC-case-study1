@@ -1,0 +1,459 @@
+---
+title: "Xgboost implementation"
+author: "Xilai Fu"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    css: style3.css
+    code_folding: hide
+    toc: true
+    number_sections: true
+    toc_float:
+      collapsed: true 
+      smooth_scroll: true
+---
+# package
+```{r}
+library(Matrix)
+library(xgboost)
+library(Ckmeans.1d.dp)
+library(RcppRoll)
+library(dplyr)
+library(imputeTS)
+```
+
+
+## Xgboost
+```{r}
+data_6 <- read.csv("data_ne.csv")
+ad <-read.csv("ssc2020_annual_demand.csv")
+### correct for discrepancy
+uy = unique(data_6$Year)
+ad
+# target + discrepancy + aggregated hourly
+disc_true = aggregate(data_6$Usage_ma,by=list(year=data_6$Year), FUN=sum)$x*0.0000036 - apply(ad[,-1],1,sum)
+data_8 = data_6
+for(j in 1:length(uy))
+  data_8[data_8$Year==uy[j],]$Usage_ma = data_8[data_8$Year==uy[j],]$Usage_ma - disc_true[j]/(0.0000036*sum(data_8$Year==uy[j]))
+```
+
+
+## Hyperparamteter tuning for min_child and max_depth
+```{r}
+usage <- data_8$Usage_ma
+
+## lag1 and lag2 estimation
+usage_na <- c(NA,NA,usage)
+
+## auto.arima imputation
+usage_imputed <- na_kalman(data_8$Usage_ma, model = "auto.arima", smooth = TRUE)
+
+## lags extraction
+data_8 <- data_8 %>% mutate(
+  lag_1 = lag(Usage_ma, 1),
+  lag_2 = lag(Usage_ma, 2),
+)
+
+## impuation for the first two lags using auto.arima(since there are only 2 missing observations, it should be fin)
+data_8$lag_1[1] <-usage_imputed[2]
+data_8$lag_2[1:2] <-usage_imputed[1:2]
+
+
+
+data_6<-select(data_8,c("Year","Month","Hour","weekend","Usage_ma","temperature","air_density","if_holiday","lag_1","lag_2"))
+
+data_6$Year<-as.integer(data_6$Year)
+data_6$weekend<-as.integer(data_6$weekend)
+data_6$Hour<-as.integer(data_6$Hour)
+data_6$if_holiday<-as.factor(data_6$if_holiday)
+
+## track currentr Min pred_abs
+currentMin = 1000
+searchGridSubCol <- expand.grid(max_depth = c(5),min_child = seq(3,10,1),eta = c(0.1))
+
+system.time(rmseErrorsHyperparameters <-
+              apply(searchGridSubCol, 1, function(parameterList) {
+                currentDepth <- parameterList[["max_depth"]]
+                currentEta <- parameterList[["eta"]]
+                currentMinChild <- parameterList[["min_child"]]
+                
+                ## Cross validation
+                pred_vec <- rep(NA, 14)
+                for (yr in 2003:2016) {
+                  train <- subset(data_6, Year != yr)
+                  test <- subset(data_6, Year == yr)
+                  
+                  
+                  ## imputation for lag1 and lag2 in the first two observations in the training set following the test set
+                  if (yr != 2016) {
+                    ## Extract the index of the year following the test year in the training data set except for 2016
+                    max_index <- max(as.integer(rownames(test)))
+                    lag1_index <- max_index + 1
+                    lag2_index <- c(max_index + 1, max_index + 2)
+                    
+                    ## Ensure that the training data does not use the data in the test set
+                    train[as.integer(rownames(train)) == lag1_index, ]$lag_1 = NA
+                    train[as.integer(rownames(train)) %in% lag2_index, ]$lag_2 = NA
+                    
+                    ## imputation for the NA value in the training data set using auto.arima
+                    train[as.integer(rownames(train)) >= lag1_index, ]$lag_1 <-
+                      na_kalman(train[as.integer(rownames(train)) >= lag1_index, ]$lag_1, model = "auto.arima", smooth = TRUE)
+                    
+                    train[as.integer(rownames(train)) >= lag1_index, ]$lag_2 <-
+                      na_kalman(train[as.integer(rownames(train)) >= lag1_index, ]$lag_2, model = "auto.arima", smooth = TRUE)
+                    
+                  }
+                  
+                  # Xgboost modeling
+                  label <- train$Usage_ma
+                  
+                  #Returns object unchanged if there are NA values
+                  previous_na_action <- options('na.action')
+                  options(na.action = 'na.pass')
+                  
+                  
+                  #Build matrix input for the training model
+                  trainMatrix <-
+                    sparse.model.matrix(
+                      ~ Year + weekend + Month + lag_1 + lag_2 + Hour + temperature + air_density+if_holiday
+                      ,
+                      data = train
+                      ,
+                      contrasts.arg = c("weekend", "if_holiday") # specify categorical variables
+                      ,
+                      sparse = FALSE,
+                      sci = FALSE
+                    )
+                  
+                  options(na.action = previous_na_action$na.action)
+                  
+                  
+                  trainDMatrix <-
+                    xgb.DMatrix(data = trainMatrix, label = label)
+                  
+                  #Set parameters of model
+                  params <- list(
+                    booster = "gbtree"
+                    ,
+                    objective = "reg:linear"
+                    ,
+                    eta = currentEta
+                    ,
+                    min_child_weight = currentMinChild
+                    ,
+                    max_depth = currentDepth
+                    ,
+                    gamma = 1
+                    ,
+                    subsample = 0.6
+                  )
+                  
+                  model <- xgb.train(
+                    data = trainDMatrix
+                    ,
+                    param = params
+                    ,
+                    maximize = FALSE,
+                    evaluation = 'mae',
+                    nrounds = 88
+                  )
+                  
+                  #Build a matrix input for the testing set
+                  testMatrix <-
+                    sparse.model.matrix(
+                      ~ Year + weekend + Month + lag_1 + lag_2 + Hour + temperature + air_density+if_holiday
+                      ,
+                      data = test
+                      ,
+                      contrasts.arg = c("weekend", "if_holiday")
+                      ,
+                      sparse = FALSE,
+                      sci = FALSE
+                    )
+                  
+                  ## Test outcome
+                  lable_test = test$Usage_ma
+                  
+                  ## prediction
+                  pred_1 <- predict(model, testMatrix)
+                  
+                  pred_vec[yr - 2002] = sum(pred_1) / 277777.78
+                  
+                }
+                
+                 pred_abs <- mean(abs(pred_vec - apply(ad[, -1], 1, sum)))
+                  
+                  
+                ## update current minimum pred_abs
+                currentMin<-min(currentMin,pred_abs)
+                 
+                print(
+                   c(
+                     "currentMinChild" = currentMinChild,
+                     "currentDepth" = currentDepth,
+                     "predict_abs" = pred_abs
+                   )
+                 )
+                
+                #sprintf(
+                #  "currentMinChild: %i,  currentDepth: %i,  predict_abs: %f,currentMinPred: %f",
+                #  currentMinChild,
+                #  currentDepth,
+                #  pred_abs,
+                #  currentMin
+                #)
+              
+                 
+                 
+                 }))
+
+importance <- xgb.importance(feature_names = colnames(trainMatrix), model = model)
+xgb.ggplot.importance(importance_matrix = importance)
+```
+According to grid Search,it turns out that the set of hyperparameters of (min_child,max_depth) that optimizes the leave_one_out cross validation is (6,5)
+## Hyperparamter tuning for gamma,subsample,colsample and eta
+```{r}
+searchGridSubCol <- expand.grid(gamma = c(0,1,3,5,7,10),subsample = seq(0.6,1,0.1),colsample = seq(0.6,1,0.1),eta = c(0.1))
+
+system.time(rmseErrorsHyperparameters <-
+              apply(searchGridSubCol, 1, function(parameterList) {
+                currentGamma <- parameterList[["gamma"]]
+                currentSubsample <- parameterList[["subsample"]]
+                currentColsample <- parameterList[["colsample"]]
+                currentEta <- parameterList[["eta"]]
+                
+                ## Cross validation
+                pred_vec <- rep(NA, 14)
+                for (yr in 2003:2016) {
+                  train <- subset(data_6, Year != yr)
+                  test <- subset(data_6, Year == yr)
+                  
+                  
+                  ## imputation for lag1 and lag2 in the first two observations in the training set following the test set
+                  if (yr != 2016) {
+                    ## Extract the index of the year following the test year in the training data set except for 2016
+                    max_index <- max(as.integer(rownames(test)))
+                    lag1_index <- max_index + 1
+                    lag2_index <- c(max_index + 1, max_index + 2)
+                    
+                    ## Ensure that the training data does not use the data in the test set
+                    train[as.integer(rownames(train)) == lag1_index, ]$lag_1 = NA
+                    train[as.integer(rownames(train)) %in% lag2_index, ]$lag_2 = NA
+                    
+                    ## imputation for the NA value in the training data set using auto.arima
+                    train[as.integer(rownames(train)) >= lag1_index, ]$lag_1 <-
+                      na_kalman(train[as.integer(rownames(train)) >= lag1_index, ]$lag_1, model = "auto.arima", smooth = TRUE)
+                    
+                    train[as.integer(rownames(train)) >= lag1_index, ]$lag_2 <-
+                      na_kalman(train[as.integer(rownames(train)) >= lag1_index, ]$lag_2, model = "auto.arima", smooth = TRUE)
+                    
+                  }
+                  
+                  # Xgboost modeling
+                  label <- train$Usage_ma
+                  
+                  #Returns object unchanged if there are NA values
+                  previous_na_action <- options('na.action')
+                  options(na.action = 'na.pass')
+                  
+                  
+                  #Build matrix input for the training model
+                  trainMatrix <-
+                    sparse.model.matrix(
+                      ~ Year + weekend + Month + lag_1 + lag_2 + Hour + temperature + air_density+if_holiday
+                      ,
+                      data = train
+                      ,
+                      contrasts.arg = c("weekend", "if_holiday") # specify categorical variables
+                      ,
+                      sparse = FALSE,
+                      sci = FALSE
+                    )
+                  
+                  options(na.action = previous_na_action$na.action)
+                  
+                  
+                  trainDMatrix <-
+                    xgb.DMatrix(data = trainMatrix, label = label)
+                  
+                  #Set parameters of model
+                  params <- list(
+                    booster = "gbtree"
+                    ,
+                    objective = "reg:linear"
+                    ,
+                    eta = currentEta
+                    ,
+                    min_child_weight = 4
+                    ,
+                    max_depth = 5
+                    ,
+                    gamma = currentGamma
+                    ,
+                    subsample = currentSubsample
+                    ,
+                    colsample = currentColsample
+                    )
+                  
+                  model <- xgb.train(
+                    data = trainDMatrix
+                    ,
+                    param = params
+                    ,
+                    maximize = FALSE,
+                    evaluation = 'mae',
+                    nrounds = 88
+                  )
+                  
+                  #Build a matrix input for the testing set
+                  testMatrix <-
+                    sparse.model.matrix(
+                      ~ Year + weekend + Month + lag_1 + lag_2 + Hour + temperature + air_density+if_holiday
+                      ,
+                      data = test
+                      ,
+                      contrasts.arg = c("weekend", "if_holiday")
+                      ,
+                      sparse = FALSE,
+                      sci = FALSE
+                    )
+                  
+                  ## Test outcome
+                  lable_test = test$Usage_ma
+                  
+                  ## prediction
+                  pred_1 <- predict(model, testMatrix)
+                  
+                  pred_vec[yr - 2002] = sum(pred_1) / 277777.78
+                  
+                }
+                
+                 pred_abs <- mean(abs(pred_vec - apply(ad[, -1], 1, sum)))
+                  
+                 
+                print(
+                   c(
+                     "currentGamma" = currentGamma,
+                     "currentSubsample" = currentSubsample,
+                     "currentColsample" = currentColsample,
+                     "currentEta" = currentEta,
+                     "predict_abs" = pred_abs
+                   )
+                 )
+              
+                 }))
+
+```
+## Final result with the optimal combination of hyperparamters
+```{r}
+## Cross validation
+pred_vec <- rep(NA, 14)
+for (yr in 2003:2016) {
+    train <- subset(data_6, Year != yr)
+    test <- subset(data_6, Year == yr)
+                  
+                  
+    ## imputation for lag1 and lag2 in the first two observations in the training set following the test set
+    if (yr != 2016) {
+                    ## Extract the index of the year following the test year in the training data set except for 2016
+    max_index <- max(as.integer(rownames(test)))
+    lag1_index <- max_index + 1
+    lag2_index <- c(max_index + 1, max_index + 2)
+                    
+    ## Ensure that the training data does not use the data in the test set
+    train[as.integer(rownames(train)) == lag1_index, ]$lag_1 = NA
+    train[as.integer(rownames(train)) %in% lag2_index, ]$lag_2 = NA
+                    
+    ## imputation for the NA value in the training data set using auto.arima
+    train[as.integer(rownames(train)) >= lag1_index, ]$lag_1 <-
+    na_kalman(train[as.integer(rownames(train)) >= lag1_index, ]$lag_1, model = "auto.arima", smooth = TRUE)
+                    
+    train[as.integer(rownames(train)) >= lag1_index, ]$lag_2 <-
+    na_kalman(train[as.integer(rownames(train)) >= lag1_index, ]$lag_2, model = "auto.arima", smooth = TRUE)
+        }
+                  
+    # Xgboost modeling
+    label <- train$Usage_ma
+                  
+    #Returns object unchanged if there are NA values
+    previous_na_action <- options('na.action')
+    options(na.action = 'na.pass')
+                  
+                  
+    #Build matrix input for the training model
+    trainMatrix <-
+    sparse.model.matrix(~ Year + weekend + Month + lag_1 + lag_2 + Hour + temperature
+                      ,
+              data = train
+                      ,
+              contrasts.arg = c("Year", "weekend", "Month", "Hour") # specify categorical variables
+                      ,
+                      sparse = FALSE,
+                      sci = FALSE
+                    )
+                  
+                  options(na.action = previous_na_action$na.action)
+                  
+                  
+                  trainDMatrix <-
+                    xgb.DMatrix(data = trainMatrix, label = label)
+
+                  
+                  #Set parameters of model
+                  params <- list(
+                    booster = "gbtree"
+                    ,
+                    objective = "reg:linear"
+                    ,
+                    eta = 0.1
+                    ,
+                    min_child_weight = 8
+                    ,
+                    max_depth = 5
+                    ,
+                    gamma = 5
+                    ,
+                    subsample = 0.8
+                    ,
+                    colsample = 0.9
+                    )
+                  
+                  model <- xgb.train(
+                    data = trainDMatrix
+                    ,
+                    param = params
+                    ,
+                    maximize = FALSE,
+                    evaluation = 'mae',
+                    nrounds = 88
+                  )
+                  
+                  #Build a matrix input for the testing set
+                  testMatrix <-
+                    sparse.model.matrix(
+                      ~ Year + weekend + Month + lag_1 + lag_2 + Hour + temperature
+                      ,
+                      data = test
+                      ,
+                      contrasts.arg = c("Year", "weekend", "Month", "Hour")
+                      ,
+                      sparse = FALSE,
+                      sci = FALSE
+                    )
+                  
+                  ## Test outcome
+                  lable_test = test$Usage_ma
+                  
+                  ## prediction
+                  pred_1 <- predict(model, testMatrix)
+                  
+                  pred_vec[yr - 2002] = sum(pred_1) / 277777.78
+                  
+                }
+                
+pred_abs <- mean(abs(pred_vec - apply(ad[, -1], 1, sum)))
+```
+```{r}
+pred_vec
+```
+
