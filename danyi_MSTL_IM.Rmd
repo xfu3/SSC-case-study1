@@ -1,0 +1,363 @@
+---
+title: "MSTL"
+author: "danyi"
+date: "10/27/2020"
+output: html_document
+---
+
+# package
+```{r}
+library(forecast)
+library(scales)
+library(tseries)
+```
+
+# function
+```{r}
+rep.col<-function(x,n){
+   matrix(rep(x,each=n), ncol=n, byrow=TRUE)
+}
+
+# a function (using the easier approach) to compute the predictions. 
+f = function(x){
+  y = rep(NA,length(x))
+  for(i in 1:length(x)){
+    if(i==1) y[i] = x[2]
+    if(i==length(x)) y[i] = x[length(x)-1]
+    if(i>1 & i<length(x)) y[i] = mean(c(x[i-1], x[i+1]))
+  }
+  return(y)
+}
+
+# get the proportions
+g = function(v) v/sum(v) # takes a vector and "normalizes" each entry by dividing by the total
+```
+
+# load data and regressors
+```{r}
+data_merge <- read.csv("data_ne.csv")
+ad <-read.csv("ssc2020_annual_demand.csv")
+
+############ correct for the discrepancy before model fitting ###############
+########## assign annual discrepancy into each hours equally ################
+### correct for discrepancy
+uy = unique(data_merge$Year)
+
+# target + discrepancy + aggregated hourly
+disc_true = aggregate(data_merge$Usage_ma,by=list(year=data_merge$Year), FUN=sum)$x*0.0000036 - apply(ad[,-1],1,sum)
+
+for(j in 1:length(uy))
+  data_merge[data_merge$Year==uy[j],]$Usage_ma = data_merge[data_merge$Year==uy[j],]$Usage_ma - disc_true[j]/(0.0000036*sum(data_merge$Year==uy[j]))
+
+ts=ts(data_merge$Usage_ma, frequency = 8760)
+
+
+# apply a function to each row or column of a matrix
+sector_pred = apply(ad[,-1], MARGIN=2, FUN=f)
+
+# use MARGIN=1 to apply function g to rows
+sector_pred_prop = apply(sector_pred, MARGIN = 1, FUN = g)
+
+################### regressors for MSTL model #######################
+#time <- 1:122736
+year <- data_merge$Year
+temp2<-data_merge$temperature^2
+air2<-data_merge$air_density^2
+xreg<-as.data.frame(cbind(year,temp2,air2))
+
+####################### Cross Validation for MSTL model ########################
+# create testing data with NAs
+
+## days=c(365,366,365,365,365,366,365,365,365,366,365,365,365,366)
+tsna <- as.data.frame(rep.col(ts,14))
+colnames(tsna) <- sapply(1:14,function(x) paste0("ts",x))
+tsna <- cbind(tsna,"year" = data_merge$Year)
+
+for(i in 1:14){tsna[tsna$year==uy[i],i] <-NA}
+```
+
+
+
+
+## model building and leave one out cross validation
+```{r}
+## "true" values in the annual demand data, after conversion to PJ
+true <- c(460.2,461.6, 467.9,472.0,469.2, 488.3,454.5,483.5,496.3,489.3,498.8,494.9,496.7,484.9)
+
+## estimated sum of hourly data
+est_sum3 <- rep(NA,14)
+
+## MAE of hourly training data
+MAEs_train <- 0
+
+## MAE of hourly testing data
+MAEs_test <- 0
+
+## MAE of annual training data
+train_MAEs <- rep(NA,14)
+
+## MSA of annul test data
+test_MAEs <-rep(NA,14) 
+
+## put in estimated hourly data for calculating MAE of annual training data
+model_fitted=data.frame(Year=data_merge$Year,fitted=NA)
+
+
+
+# leave one year out cross validation
+for (i in 1:14) {
+  year <- uy[i]
+  x <- msts(tsna[, i], seasonal.periods = c(24, 168, 8760))
+  y <- mstl(x,
+            s.window = 24 * 30 * 12 * 9,
+            t.window = 24 * 30 * 12 * 9)
+  
+  remainder <- y[, 6]
+  
+  xreg1 <- xreg[which(xreg$year < year),]  ## left predictors
+  xreg2 <- xreg[which(xreg$year > year),]  ## right predictors
+  xregna <- xreg[which(xreg$year == year),] ## NA predictors
+  
+  if (i == 1) {
+    print(paste("MAE of training data when test year is", i))
+    
+    # backward prediction
+    revxreg01 = matrix(0, dim(xreg2)[1], dim(xreg2)[2])
+    
+    ## reverse the regressors
+    for (j in 1:dim(xreg2)[2]) {
+      revxreg01[, j] <- rev(xreg2[, j])
+    }
+    
+    ## extract the remainder of the time series object
+    rev = ts(rev(remainder[which(xreg$year > year)]), frequency = 8760)
+    
+    ## model constructor for i = 1
+    model01 = Arima(rev, c(2, 0, 0), xreg = as.matrix(revxreg01[, -1]))
+    
+    ## forcaset the training remainder
+    train01 <- forecast(model01,
+                        h = dim(xreg2)[1],
+                        xreg = as.matrix(revxreg01[,-1]))
+    
+    train01$mean <- ts(rev(train01$mean))
+    
+    ## add the predicted remainder to the other ts components to get the prediction of the targeted ts object in the training set
+    train_pre <-
+      train01$mean + rowSums(y[which(xreg$year > year),-c(1, 6)])
+    
+    ## reverse the test predictors
+    revxregna = matrix(0, dim(xregna)[1], dim(xregna)[2])
+    for (m in 1:dim(xregna)[2]) {
+      revxregna[, m] = xregna[, m]
+    }
+    
+    ## forcaset the remainder part of the ts object in the test set
+    ave01 <-
+      forecast(model01,
+               xreg = as.matrix(revxregna[,-1]),
+               h = dim(xregna)[1])
+    ave01$mean = ts(rev(ave01$mean))
+    
+    ## add the predicted remainder to the other ts components to get the the prediction of the targered rs obejct in the test set
+    pre <-
+      ave01$mean + rowSums(y[which(xreg$year == year),-c(1, 6)])
+    
+    ## test set predictions
+    model_fitted[which(xreg$year == year), 2] <- pre
+    
+    ## right_training set predictions
+    model_fitted[which(xreg$year > year), 2] <- train_pre
+    
+    pred_yr_demand <-
+      aggregate(x = model_fitted[, 2],
+                by = list(year = model_fitted[, 1]),
+                FUN = sum) # sum predictions according to year
+    
+  } else if (i == 14) {
+    print(paste("MAE of training data when test year is", i))
+    
+    
+    # forward prediction
+    model14 <-
+      Arima(remainder[which(xreg$year < year)], c(2, 0, 0), xreg =
+              as.matrix(xreg1[, -1]))
+    
+    ## test set predictions (left)
+    left <-
+      forecast(model14, h = dim(xregna)[1], xreg = as.matrix(xregna[, -1]))
+    
+    ## training set predictions (left)
+    left_train <-
+      forecast(model14, h = dim(xreg1)[1], xreg = as.matrix(xreg1[, -1]))
+    
+    
+    ## add the predicted remainder to the other ts components to get the prediction of the targeted ts object in the training set
+    train_pre <-
+      left_train$mean + rowSums(y[which(xreg$year < year),-c(1, 6)])
+    
+    ## add the predicted remainder to the other ts components to get the the prediction of the targered rs obejct in the test set
+    pre <-
+      left$mean + rowSums(y[which(xreg$year == year),-c(1, 6)])
+    
+    ## test set predictions
+    model_fitted[which(xreg$year == year), 2] <- pre
+    
+    ## right_training set predictions
+    model_fitted[which(xreg$year < year), 2] <- train_pre
+    
+    pred_yr_demand <-
+      aggregate(x = model_fitted[, 2],
+                by = list(year = model_fitted[, 1]),
+                FUN = sum) # sum predictions according to year
+    
+  } else{
+    # forward prediction
+    modelleft <-
+      Arima(remainder[which(xreg$year < year)], c(2, 0, 0), xreg =
+              as.matrix(xreg1[, -1]))
+    
+    ## test set predictions (left)
+    left <-
+      forecast(modelleft,
+               h = dim(xregna)[1],
+               xreg = as.matrix(xregna[, -1]))
+    
+    ## training set predictions (left)
+    left_train <-
+      forecast(modelleft, h = dim(xreg1)[1], xreg = as.matrix(xreg1[, -1]))
+    
+    
+    # backward prediction
+    rev <-
+      ts(rev(remainder[which(xreg$year > year)]), frequency = 8760)
+    
+    revxreg2 <- matrix(0, dim(xreg2)[1], dim(xreg2)[2])
+    
+    ## reverse training predictors
+    for (j in 1:dim(xreg2)[2]) {
+      revxreg2[, j] <- rev(xreg2[, j])
+    }
+    
+    modelright <- Arima(rev, c(2, 0, 0), xreg = revxreg2[, -1])
+    
+    revxregna <- matrix(0, dim(xregna)[1], dim(xregna)[2])
+    
+    ## reverse test predictors
+    for (m in 1:dim(xregna)[2]) {
+      revxregna[, m] <- rev(xregna[, m])
+    }
+    
+    ## test set predictions (right)
+    right <- forecast(modelright,
+                      h = dim(xregna)[1],
+                      xreg = as.matrix(revxregna[, -1]))
+    
+    ## training set predictions (right)
+    right_train <- forecast(modelright,
+                            h = dim(xreg2)[1],
+                            xreg = as.matrix(revxreg2[, -1]))
+    
+    ## reverse
+    right$mean <- ts(rev(right$mean))
+    
+    right_train$mean <- ts(rev(right_train$mean))
+    
+    print(paste("MAE of training data when test year is", i))
+    
+    # weighted average remainder predictions (test)
+    ave_remainder <-
+      (dim(xreg1)[1] / (dim(xreg1)[1] + dim(xreg2)[1])) * data.frame(as.matrix(left$mean)) +
+      (dim(xreg2)[1] / (dim(xreg1)[1] + dim(xreg2)[1])) * data.frame(as.matrix(right$mean))
+    
+    ## weighted average prediction (test)
+    pre <-
+      ave_remainder + rowSums(y[which(xreg$year == year), -c(1, 6)])
+    
+    ## left training set predictions
+    left_pre <-
+      left_train$mean + rowSums(y[which(xreg$year < year), -c(1, 6)])
+    
+    ## right training set predictions
+    right_pre <-
+      right_train$mean + rowSums(y[which(xreg$year > year), -c(1, 6)])
+    
+    print(paste("Estimated annual data in year", i))
+    
+    
+    ## test set predictions
+    model_fitted[which(xreg$year == year), 2] <- pre
+    
+    ## left_training set predictions
+    model_fitted[which(xreg$year < year), 2] <- left_pre
+    
+    ## right_training set predictions
+    model_fitted[which(xreg$year > year), 2] <- right_pre
+    
+    pred_yr_demand <-
+      aggregate(x = model_fitted[, 2],
+                by = list(year = model_fitted[, 1]),
+                FUN = sum) # sum predictions according to year
+    
+  }
+  
+  # test set annual predictions sum
+  test_MAE <- abs(pred_yr_demand$x[i] * 0.0000036 - true[i])
+  test_MAEs[i] <- test_MAE
+  
+  # estimated annual test
+  est_annual <- sum(pre) * 0.0000036
+  est_sum3[i] <- est_annual
+  
+  # training MAE
+  train_MAE <-
+    mean(abs(pred_yr_demand$x[-i] * 0.0000036 - true[-i]))
+  train_MAEs[i] <- train_MAE
+  
+}
+
+## averaged annual test error of prediction
+mean(test_MAEs)
+
+## averaged annual training error of prediction
+mean(train_MAEs)
+
+######### calculate the sector-specific annual demand from MSTL model############
+
+## residential sector
+est_res2=est_sum3*0.0000036*t(sector_pred_prop)[,1]
+
+## industrial sector
+est_ind2=est_sum3*0.0000036*t(sector_pred_prop)[,2]
+
+## commerical sector
+est_com2=est_sum3*0.0000036*t(sector_pred_prop)[,3]
+
+## agricultural sector
+est_agri2=est_sum3*0.0000036*t(sector_pred_prop)[,4]
+est_trans2=est_sum3*0.0000036*t(sector_pred_prop)[,5]
+
+```
+# test and training error visualizations
+```{r, fig.width = 8, fig.height = 6}
+
+dev.off() # reset graphical parameters
+
+pal = c("#1B9E77","#D95F02","#7570B3","#E7298A","#66A61E","#E6AB02","#A6761D","#666666")
+pal_sub = pal[c(1:3,5:6)]
+
+plot.new()
+par(mar=c(4.3,4.3,0,0), cex.axis=1.75)
+
+
+plot(uy,test_MAEs, axes=F, xlab="",ylab="",frame = FALSE, pch = 19, type = "b", lty = 1,lwd=3, col=pal_sub[3])
+lines(uy,train_MAEs,type = "b", lwd=3,lty = 2, col= alpha(pal_sub[1],0.6))
+title(xlab = "Years",ylab="Total energy used(MW)",cex.lab=1.38,cex.main = 1.48)
+axis(side=1, at=uy, labels= uy, cex.lab=0.6)
+axis(side=2, at=seq(0,30,5), labels = seq(0,30,5), cex.lab=0.6)
+#legend('topright',legend=c("Test MAE","Training MAE"),col = pal_sub[c(3,1)], ncol = 4,lwd=10, cex=1.6, bty = "n", seg.len = 0.4, inset=c(-0.06,0,0,0))
+
+legend("topright", legend=c("Test MAE","Training MAE"),
+       col=pal_sub[c(3,1)], lty = 1:2, cex=1.58,bty = "n", seg.len = 1.38,lwd = 3)
+```
+
